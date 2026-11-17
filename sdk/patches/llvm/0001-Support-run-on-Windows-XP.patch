@@ -1,0 +1,743 @@
+Let LLVM's Windows support code run on Windows XP.
+
+Vista and Windows 7 APIs that LLVM (and lldb, see 0002) call directly are
+replaced by the XPCompat.h stand-ins, which use the real function when the
+system has it and an XP fallback otherwise.  Calls that pass Windows 7
+flags to older functions (FindFirstFileExW, LoadLibraryExA) are retried
+without them.  PSAPI_VERSION 1 takes the process status functions from
+psapi.dll.
+
+diff -Nru a/llvm/include/llvm/Support/Windows/WindowsSupport.h b/llvm/include/llvm/Support/Windows/WindowsSupport.h
+--- a/llvm/include/llvm/Support/Windows/WindowsSupport.h	2026-11-17 13:31:37.757398000 -0600
++++ b/llvm/include/llvm/Support/Windows/WindowsSupport.h	2026-11-17 13:31:37.644197600 -0600
+@@ -30,6 +30,10 @@
+ #ifndef NOMINMAX
+ #define NOMINMAX
+ #endif
++// Process status functions from psapi.dll, not the Windows 7 K32* exports
++// of kernel32.dll, so that the programs also run on Windows XP.
++#undef PSAPI_VERSION
++#define PSAPI_VERSION 1
+ 
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringExtras.h"
+@@ -49,6 +53,9 @@
+ // Must be included after windows.h
+ #include <wincrypt.h>
+ 
++// Run-time fallbacks for the Vista and Windows 7 APIs used here.
++#include "llvm/Support/Windows/XPCompat.h"
++
+ namespace llvm {
+ 
+ /// Determines if the program is running on Windows 8 or newer. This
+diff -Nru a/llvm/include/llvm/Support/Windows/XPCompat.h b/llvm/include/llvm/Support/Windows/XPCompat.h
+--- a/llvm/include/llvm/Support/Windows/XPCompat.h	1969-12-31 18:00:00.000000000 -0600
++++ b/llvm/include/llvm/Support/Windows/XPCompat.h	2026-11-17 13:31:37.868047900 -0600
+@@ -0,0 +1,619 @@
++//===- llvm/Support/Windows/XPCompat.h - Windows XP fallbacks ---*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Lets LLVM run on Windows XP.  Each function below stands in for a Windows
++// API of the same name.  For Vista and Windows 7 APIs it calls the real
++// function when the system has it (looked up at run time, so the executable
++// does not import it) and otherwise does the same job with what XP provides,
++// or fails the way the callers already expect from older systems and Wine.
++// For older APIs that LLVM calls with flags XP does not know, it retries
++// without them.
++//
++// Included from WindowsSupport.h; the #defines at the end redirect
++// everything after it to these versions.  The shell functions are in
++// XPCompatShell.h, for files that include <shlobj.h>.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_SUPPORT_WINDOWS_XPCOMPAT_H
++#define LLVM_SUPPORT_WINDOWS_XPCOMPAT_H
++
++#include <errno.h>
++#include <io.h>
++#include <stdio.h>
++#include <string.h>
++#include <wchar.h>
++#include <wctype.h>
++
++namespace llvm {
++namespace xpcompat {
++
++template <typename F> inline F lookup(const char *Dll, const char *Name) {
++  HMODULE M = ::GetModuleHandleA(Dll);
++  if (!M)
++    M = ::LoadLibraryA(Dll);
++  return M ? reinterpret_cast<F>(
++                 reinterpret_cast<void *>(::GetProcAddress(M, Name)))
++           : nullptr;
++}
++
++// ---- ntdll pieces present since NT 4 ---------------------------------------
++
++typedef LONG XP_NTSTATUS;
++struct XP_IO_STATUS_BLOCK {
++  union {
++    XP_NTSTATUS Status;
++    PVOID Pointer;
++  };
++  ULONG_PTR Information;
++};
++struct XP_UNICODE_STRING {
++  USHORT Length;
++  USHORT MaximumLength;
++  PWSTR Buffer;
++};
++struct XP_THREAD_BASIC_INFORMATION {
++  XP_NTSTATUS ExitStatus;
++  PVOID TebBaseAddress;
++  HANDLE UniqueProcess; // CLIENT_ID
++  HANDLE UniqueThread;
++  ULONG_PTR AffinityMask;
++  LONG Priority;
++  LONG BasePriority;
++};
++typedef XP_NTSTATUS(NTAPI *NtSetInformationFileFn)(HANDLE,
++                                                   XP_IO_STATUS_BLOCK *,
++                                                   PVOID, ULONG, int);
++typedef XP_NTSTATUS(NTAPI *NtQueryObjectFn)(HANDLE, int, PVOID, ULONG,
++                                            PULONG);
++typedef XP_NTSTATUS(NTAPI *NtQueryInformationThreadFn)(HANDLE, int, PVOID,
++                                                       ULONG, PULONG);
++typedef ULONG(NTAPI *RtlNtStatusToDosErrorFn)(XP_NTSTATUS);
++
++inline BOOL failNt(XP_NTSTATUS St) {
++  static auto ToDos = lookup<RtlNtStatusToDosErrorFn>(
++      "ntdll.dll", "RtlNtStatusToDosError");
++  ::SetLastError(ToDos ? ToDos(St) : ERROR_GEN_FAILURE);
++  return FALSE;
++}
++
++// ---- files -----------------------------------------------------------------
++
++// XP: deletion on close through NtSetInformationFile, which is what Vista's
++// kernel32 does too.  Renames report "not implemented"; the callers then fall
++// back to MoveFileExW, as they do on Wine.
++inline BOOL WINAPI SetFileInformationByHandle(HANDLE H,
++                                              FILE_INFO_BY_HANDLE_CLASS Class,
++                                              LPVOID Info, DWORD Size) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
++  static Fn Real = lookup<Fn>("kernel32.dll", "SetFileInformationByHandle");
++  if (Real)
++    return Real(H, Class, Info, Size);
++  if (Class == FileDispositionInfo && Size >= sizeof(BOOLEAN)) {
++    static auto NtSet = lookup<NtSetInformationFileFn>("ntdll.dll",
++                                                       "NtSetInformationFile");
++    if (!NtSet) {
++      ::SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++      return FALSE;
++    }
++    XP_IO_STATUS_BLOCK Io{};
++    BOOLEAN Delete = static_cast<FILE_DISPOSITION_INFO *>(Info)->DeleteFile;
++    XP_NTSTATUS St = NtSet(H, &Io, &Delete, sizeof(Delete),
++                           13 /* FileDispositionInformation */);
++    return St >= 0 ? TRUE : failNt(St);
++  }
++  ::SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++  return FALSE;
++}
++
++// An NT path (\Device\HarddiskVolume1\dir\file) as a DOS one (C:\dir\file):
++// the drive letter whose device is the path's prefix.  Returns the length
++// written (no terminator), or 0 when no drive matches or it does not fit.
++inline size_t NtPathToDos(const wchar_t *Nt, size_t NtLen, wchar_t *Out,
++                          size_t Count) {
++  wchar_t Drive[3] = L"A:";
++  for (wchar_t D = L'A'; D <= L'Z'; ++D) {
++    wchar_t Target[1024];
++    Drive[0] = D;
++    if (!::QueryDosDeviceW(Drive, Target, 1024))
++      continue;
++    size_t TL = wcslen(Target);
++    if (TL && TL < NtLen && wcsncmp(Nt, Target, TL) == 0 &&
++        Nt[TL] == L'\\') {
++      if (2 + NtLen - TL >= Count) {
++        ::SetLastError(ERROR_FILENAME_EXCED_RANGE);
++        return 0;
++      }
++      Out[0] = D;
++      Out[1] = L':';
++      wmemcpy(Out + 2, Nt + TL, NtLen - TL);
++      return 2 + NtLen - TL;
++    }
++  }
++  ::SetLastError(ERROR_PATH_NOT_FOUND);
++  return 0;
++}
++
++// XP: the handle's NT name (\Device\HarddiskVolume1\dir\file) from
++// NtQueryObject, with the device mapped back to its drive letter for
++// VOLUME_NAME_DOS.  Only disk files: NtQueryObject can block on pipes.
++inline DWORD WINAPI GetFinalPathNameByHandleW(HANDLE H, LPWSTR Out,
++                                              DWORD Count, DWORD Flags) {
++  typedef DWORD(WINAPI * Fn)(HANDLE, LPWSTR, DWORD, DWORD);
++  static Fn Real = lookup<Fn>("kernel32.dll", "GetFinalPathNameByHandleW");
++  if (Real)
++    return Real(H, Out, Count, Flags);
++  static auto NtQuery = lookup<NtQueryObjectFn>("ntdll.dll", "NtQueryObject");
++  if (!NtQuery || ::GetFileType(H) != FILE_TYPE_DISK) {
++    ::SetLastError(ERROR_NOT_SUPPORTED);
++    return 0;
++  }
++  union {
++    XP_UNICODE_STRING Name;
++    wchar_t Space[4096];
++  } Buf;
++  ULONG Len = 0;
++  XP_NTSTATUS St = NtQuery(H, 1 /* ObjectNameInformation */, &Buf,
++                           sizeof(Buf) - sizeof(wchar_t), &Len);
++  if (St < 0) {
++    failNt(St);
++    return 0;
++  }
++  const wchar_t *Nt = Buf.Name.Buffer;
++  size_t NtLen = Buf.Name.Length / sizeof(wchar_t);
++  wchar_t Result[4096 + 8];
++  size_t N = 0;
++
++  if ((Flags & 0xf) == 0x2 /* VOLUME_NAME_NT */) {
++    if (NtLen >= 4096) {
++      ::SetLastError(ERROR_FILENAME_EXCED_RANGE);
++      return 0;
++    }
++    wmemcpy(Result, Nt, NtLen);
++    N = NtLen;
++  } else {
++    wmemcpy(Result, L"\\\\?\\", 4);
++    N = NtPathToDos(Nt, NtLen, Result + 4, 4096);
++    if (N == 0)
++      return 0;
++    N += 4;
++  }
++  // like the real one: the length without the terminator when it fits,
++  // else the size needed including it
++  if (N + 1 > Count)
++    return static_cast<DWORD>(N + 1);
++  wmemcpy(Out, Result, N);
++  Out[N] = 0;
++  return static_cast<DWORD>(N);
++}
++
++// ---- old functions, newer flags --------------------------------------------
++// These exist on XP, but XP rejects flag values added later with
++// ERROR_INVALID_PARAMETER.  Retry with what XP understands.
++
++#if _WIN32_WINNT >= 0x0601
++// FindExInfoBasic and FIND_FIRST_EX_LARGE_FETCH are Windows 7 additions;
++// both are only optimisations.
++#define LLVM_XPCOMPAT_FINDFIRSTFILEEX
++inline HANDLE WINAPI FindFirstFileExW(LPCWSTR Name, FINDEX_INFO_LEVELS Level,
++                                      LPVOID Data, FINDEX_SEARCH_OPS Op,
++                                      LPVOID Filter, DWORD Flags) {
++  HANDLE H = ::FindFirstFileExW(Name, Level, Data, Op, Filter, Flags);
++  if (H == INVALID_HANDLE_VALUE &&
++      ::GetLastError() == ERROR_INVALID_PARAMETER &&
++      (Level == FindExInfoBasic || (Flags & FIND_FIRST_EX_LARGE_FETCH)))
++    H = ::FindFirstFileExW(Name, FindExInfoStandard, Data, Op, Filter,
++                           Flags & ~FIND_FIRST_EX_LARGE_FETCH);
++  return H;
++}
++#endif
++
++// The LOAD_LIBRARY_SEARCH_* flags need Windows 7 (or KB2533623).  Without
++// them, load from the system directory by full path, which is what
++// LOAD_LIBRARY_SEARCH_SYSTEM32 asks for anyway.
++inline HMODULE WINAPI LoadLibraryExA(LPCSTR Name, HANDLE File, DWORD Flags) {
++  const DWORD SearchFlags = 0x0000ff00; // LOAD_LIBRARY_SEARCH_*
++  HMODULE M = ::LoadLibraryExA(Name, File, Flags);
++  if (M || !(Flags & SearchFlags) ||
++      ::GetLastError() != ERROR_INVALID_PARAMETER)
++    return M;
++  char Path[MAX_PATH];
++  UINT N = ::GetSystemDirectoryA(Path, MAX_PATH);
++  if ((Flags & 0x00000800 /* LOAD_LIBRARY_SEARCH_SYSTEM32 */) && N &&
++      N + 1 + strlen(Name) < MAX_PATH && !strchr(Name, '\\')) {
++    Path[N] = '\\';
++    strcpy(Path + N + 1, Name);
++    return ::LoadLibraryExA(Path, File, Flags & ~SearchFlags);
++  }
++  return ::LoadLibraryExA(Name, File, Flags & ~SearchFlags);
++}
++
++// ---- strings and registry --------------------------------------------------
++
++// XP: ordinal (code unit) comparison, upper-casing for ignore-case the way
++// the real function does.
++inline int WINAPI CompareStringOrdinal(LPCWCH A, int NA, LPCWCH B, int NB,
++                                       BOOL IgnoreCase) {
++  typedef int(WINAPI * Fn)(LPCWCH, int, LPCWCH, int, BOOL);
++  static Fn Real = lookup<Fn>("kernel32.dll", "CompareStringOrdinal");
++  if (Real)
++    return Real(A, NA, B, NB, IgnoreCase);
++  size_t LA = NA < 0 ? wcslen(A) : static_cast<size_t>(NA);
++  size_t LB = NB < 0 ? wcslen(B) : static_cast<size_t>(NB);
++  for (size_t I = 0; I < LA && I < LB; ++I) {
++    wchar_t CA = A[I], CB = B[I];
++    if (IgnoreCase) {
++      CA = towupper(CA);
++      CB = towupper(CB);
++    }
++    if (CA != CB)
++      return CA < CB ? CSTR_LESS_THAN : CSTR_GREATER_THAN;
++  }
++  return LA == LB ? CSTR_EQUAL : LA < LB ? CSTR_LESS_THAN : CSTR_GREATER_THAN;
++}
++
++// XP: RegOpenKeyExW + RegQueryValueExW, checking the type against the
++// RRF_RT_* flags.  No expansion of REG_EXPAND_SZ (callers here ask for the
++// raw data).
++inline LSTATUS WINAPI RegGetValueW(HKEY Key, LPCWSTR SubKey, LPCWSTR Value,
++                                   DWORD Flags, LPDWORD Type, PVOID Data,
++                                   LPDWORD Bytes) {
++  typedef LSTATUS(WINAPI * Fn)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID,
++                               LPDWORD);
++  static Fn Real = lookup<Fn>("advapi32.dll", "RegGetValueW");
++  if (Real)
++    return Real(Key, SubKey, Value, Flags, Type, Data, Bytes);
++  HKEY K = Key;
++  if (SubKey && *SubKey) {
++    LSTATUS R = ::RegOpenKeyExW(Key, SubKey, 0, KEY_QUERY_VALUE, &K);
++    if (R != ERROR_SUCCESS)
++      return R;
++  }
++  DWORD T = 0;
++  LSTATUS R = ::RegQueryValueExW(K, Value, nullptr, &T,
++                                 static_cast<LPBYTE>(Data), Bytes);
++  if (K != Key)
++    ::RegCloseKey(K);
++  if (R != ERROR_SUCCESS)
++    return R;
++  if (T <= 11 && !(Flags & (1u << T)) && (Flags & 0xffff) != 0xffff)
++    return ERROR_UNSUPPORTED_TYPE;
++  if (Type)
++    *Type = T;
++  return ERROR_SUCCESS;
++}
++
++// ---- threads, processors and memory ----------------------------------------
++
++// XP: the thread id from NtQueryInformationThread (ThreadBasicInformation).
++inline DWORD WINAPI GetThreadId(HANDLE Thread) {
++  typedef DWORD(WINAPI * Fn)(HANDLE);
++  static Fn Real = lookup<Fn>("kernel32.dll", "GetThreadId");
++  if (Real)
++    return Real(Thread);
++  if (Thread == ::GetCurrentThread())
++    return ::GetCurrentThreadId();
++  static auto NtQuery = lookup<NtQueryInformationThreadFn>(
++      "ntdll.dll", "NtQueryInformationThread");
++  XP_THREAD_BASIC_INFORMATION Info{};
++  if (!NtQuery)
++    return 0;
++  XP_NTSTATUS St = NtQuery(Thread, 0, &Info, sizeof(Info), nullptr);
++  if (St < 0) {
++    failNt(St);
++    return 0;
++  }
++  return static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(Info.UniqueThread));
++}
++
++// XP: no large pages.
++inline SIZE_T WINAPI GetLargePageMinimum() {
++  typedef SIZE_T(WINAPI * Fn)();
++  static Fn Real = lookup<Fn>("kernel32.dll", "GetLargePageMinimum");
++  return Real ? Real() : 0;
++}
++
++#if _WIN32_WINNT >= 0x0601
++// XP has one processor group: report "not implemented" for the topology
++// queries, which the callers treat like a system without the feature, and
++// map group affinities onto the plain affinity masks.
++#define LLVM_XPCOMPAT_PROCESSOR_GROUPS
++inline BOOL WINAPI GetLogicalProcessorInformationEx(
++    LOGICAL_PROCESSOR_RELATIONSHIP Rel,
++    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX Buf, PDWORD Len) {
++  typedef BOOL(WINAPI * Fn)(LOGICAL_PROCESSOR_RELATIONSHIP,
++                            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PDWORD);
++  static Fn Real =
++      lookup<Fn>("kernel32.dll", "GetLogicalProcessorInformationEx");
++  if (Real)
++    return Real(Rel, Buf, Len);
++  ::SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++  return FALSE;
++}
++
++inline BOOL WINAPI GetProcessGroupAffinity(HANDLE Process, PUSHORT Count,
++                                           PUSHORT Groups) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, PUSHORT, PUSHORT);
++  static Fn Real = lookup<Fn>("kernel32.dll", "GetProcessGroupAffinity");
++  if (Real)
++    return Real(Process, Count, Groups);
++  ::SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++  return FALSE;
++}
++
++inline BOOL WINAPI GetThreadGroupAffinity(HANDLE Thread,
++                                          PGROUP_AFFINITY Affinity) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, PGROUP_AFFINITY);
++  static Fn Real = lookup<Fn>("kernel32.dll", "GetThreadGroupAffinity");
++  if (Real)
++    return Real(Thread, Affinity);
++  DWORD_PTR ProcessMask = 0, SystemMask = 0;
++  if (!::GetProcessAffinityMask(::GetCurrentProcess(), &ProcessMask,
++                                &SystemMask))
++    return FALSE;
++  ZeroMemory(Affinity, sizeof(*Affinity));
++  Affinity->Mask = ProcessMask;
++  return TRUE;
++}
++
++inline BOOL WINAPI SetThreadGroupAffinity(HANDLE Thread,
++                                          const GROUP_AFFINITY *Affinity,
++                                          PGROUP_AFFINITY Previous) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, const GROUP_AFFINITY *, PGROUP_AFFINITY);
++  static Fn Real = lookup<Fn>("kernel32.dll", "SetThreadGroupAffinity");
++  if (Real)
++    return Real(Thread, Affinity, Previous);
++  if (Affinity->Group != 0) {
++    ::SetLastError(ERROR_INVALID_PARAMETER);
++    return FALSE;
++  }
++  DWORD_PTR Old = ::SetThreadAffinityMask(Thread, Affinity->Mask);
++  if (!Old)
++    return FALSE;
++  if (Previous) {
++    ZeroMemory(Previous, sizeof(*Previous));
++    Previous->Mask = Old;
++  }
++  return TRUE;
++}
++#endif
++
++// ---- I/O, processes, links (used by lldb) ----------------------------------
++
++// XP: CancelIo, which cancels only the calling thread's I/O on the handle.
++// That is what the callers need where they cancel their own overlapped
++// operations; closing the handle cancels the rest.
++inline BOOL WINAPI CancelIoEx(HANDLE H, LPOVERLAPPED Ov) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, LPOVERLAPPED);
++  static Fn Real = lookup<Fn>("kernel32.dll", "CancelIoEx");
++  if (Real)
++    return Real(H, Ov);
++  return ::CancelIo(H);
++}
++
++// Whether CancelIoEx can cancel another thread's I/O.
++inline bool HaveCancelIoEx() {
++  return lookup<FARPROC>("kernel32.dll", "CancelIoEx") != nullptr;
++}
++
++// XP: GetProcessImageFileNameW from psapi.dll, which the kernel answers
++// even before the process's loader has run, with the NT path mapped to a
++// DOS one unless PROCESS_NAME_NATIVE is asked for.  (GetModuleFileNameExW
++// fails until the loader has set up the module list, e.g. at the
++// create-process debug event.)
++inline BOOL WINAPI QueryFullProcessImageNameW(HANDLE Process, DWORD Flags,
++                                              LPWSTR Name, PDWORD Size) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, DWORD, LPWSTR, PDWORD);
++  static Fn Real = lookup<Fn>("kernel32.dll", "QueryFullProcessImageNameW");
++  if (Real)
++    return Real(Process, Flags, Name, Size);
++  typedef DWORD(WINAPI * ImageFn)(HANDLE, LPWSTR, DWORD);
++  static ImageFn Image =
++      lookup<ImageFn>("psapi.dll", "GetProcessImageFileNameW");
++  wchar_t Nt[1024];
++  DWORD NtLen = Image ? Image(Process, Nt, 1024) : 0;
++  size_t N;
++  if (NtLen == 0 || NtLen >= 1024)
++    return FALSE;
++  if (Flags & 1 /* PROCESS_NAME_NATIVE */) {
++    if (NtLen >= *Size) {
++      ::SetLastError(ERROR_INSUFFICIENT_BUFFER);
++      return FALSE;
++    }
++    wmemcpy(Name, Nt, NtLen);
++    N = NtLen;
++  } else {
++    N = NtPathToDos(Nt, NtLen, Name, *Size);
++    if (N == 0)
++      return FALSE;
++  }
++  Name[N] = 0;
++  *Size = static_cast<DWORD>(N);
++  return TRUE;
++}
++
++// XP has no symbolic links for files.
++inline BOOLEAN WINAPI CreateSymbolicLinkW(LPCWSTR Link, LPCWSTR Target,
++                                          DWORD Flags) {
++  typedef BOOLEAN(WINAPI * Fn)(LPCWSTR, LPCWSTR, DWORD);
++  static Fn Real = lookup<Fn>("kernel32.dll", "CreateSymbolicLinkW");
++  if (Real)
++    return Real(Link, Target, Flags);
++  ::SetLastError(ERROR_NOT_SUPPORTED);
++  return FALSE;
++}
++
++// Debugging a 32-bit process from a 64-bit debugger; never needed on 32-bit
++// XP.
++inline BOOL WINAPI Wow64GetThreadContext(HANDLE Thread, PWOW64_CONTEXT Ctx) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, PWOW64_CONTEXT);
++  static Fn Real = lookup<Fn>("kernel32.dll", "Wow64GetThreadContext");
++  if (Real)
++    return Real(Thread, Ctx);
++  ::SetLastError(ERROR_NOT_SUPPORTED);
++  return FALSE;
++}
++
++inline BOOL WINAPI Wow64SetThreadContext(HANDLE Thread,
++                                         const WOW64_CONTEXT *Ctx) {
++  typedef BOOL(WINAPI * Fn)(HANDLE, const WOW64_CONTEXT *);
++  static Fn Real = lookup<Fn>("kernel32.dll", "Wow64SetThreadContext");
++  if (Real)
++    return Real(Thread, Ctx);
++  ::SetLastError(ERROR_NOT_SUPPORTED);
++  return FALSE;
++}
++
++// Process attribute lists (Vista): XP has none.  The list calls succeed
++// without doing anything, and CreateProcessW below drops the extended
++// start-up information; the child then inherits every inheritable handle,
++// as all children did before Vista.
++inline bool HaveAttributeLists() {
++  return lookup<FARPROC>("kernel32.dll",
++                         "InitializeProcThreadAttributeList") != nullptr;
++}
++
++inline BOOL WINAPI InitializeProcThreadAttributeList(
++    LPPROC_THREAD_ATTRIBUTE_LIST List, DWORD Count, DWORD Flags,
++    PSIZE_T Size) {
++  typedef BOOL(WINAPI * Fn)(LPPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD,
++                            PSIZE_T);
++  static Fn Real =
++      lookup<Fn>("kernel32.dll", "InitializeProcThreadAttributeList");
++  if (Real)
++    return Real(List, Count, Flags, Size);
++  const SIZE_T Need = 64;
++  if (!List || *Size < Need) {
++    *Size = Need;
++    ::SetLastError(ERROR_INSUFFICIENT_BUFFER);
++    return FALSE;
++  }
++  ZeroMemory(List, Need);
++  return TRUE;
++}
++
++inline BOOL WINAPI UpdateProcThreadAttribute(
++    LPPROC_THREAD_ATTRIBUTE_LIST List, DWORD Flags, DWORD_PTR Attribute,
++    PVOID Value, SIZE_T Size, PVOID Previous, PSIZE_T ReturnSize) {
++  typedef BOOL(WINAPI * Fn)(LPPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD_PTR,
++                            PVOID, SIZE_T, PVOID, PSIZE_T);
++  static Fn Real = lookup<Fn>("kernel32.dll", "UpdateProcThreadAttribute");
++  if (Real)
++    return Real(List, Flags, Attribute, Value, Size, Previous, ReturnSize);
++  return TRUE;
++}
++
++inline VOID WINAPI DeleteProcThreadAttributeList(
++    LPPROC_THREAD_ATTRIBUTE_LIST List) {
++  typedef VOID(WINAPI * Fn)(LPPROC_THREAD_ATTRIBUTE_LIST);
++  static Fn Real =
++      lookup<Fn>("kernel32.dll", "DeleteProcThreadAttributeList");
++  if (Real)
++    Real(List);
++}
++
++inline BOOL WINAPI CreateProcessW(LPCWSTR App, LPWSTR Cmd,
++                                  LPSECURITY_ATTRIBUTES ProcAttr,
++                                  LPSECURITY_ATTRIBUTES ThreadAttr,
++                                  BOOL Inherit, DWORD Flags, LPVOID Env,
++                                  LPCWSTR Dir, LPSTARTUPINFOW Startup,
++                                  LPPROCESS_INFORMATION Info) {
++  if ((Flags & EXTENDED_STARTUPINFO_PRESENT) && !HaveAttributeLists()) {
++    STARTUPINFOW Plain = *Startup;
++    Plain.cb = sizeof(Plain);
++    return ::CreateProcessW(App, Cmd, ProcAttr, ThreadAttr, Inherit,
++                            Flags & ~EXTENDED_STARTUPINFO_PRESENT, Env, Dir,
++                            &Plain, Info);
++  }
++  return ::CreateProcessW(App, Cmd, ProcAttr, ThreadAttr, Inherit, Flags, Env,
++                          Dir, Startup, Info);
++}
++
++// XP: setting the mode returns the old one; put it back.
++inline UINT WINAPI GetErrorMode() {
++  typedef UINT(WINAPI * Fn)();
++  static Fn Real = lookup<Fn>("kernel32.dll", "GetErrorMode");
++  if (Real)
++    return Real();
++  UINT Mode = ::SetErrorMode(0);
++  ::SetErrorMode(Mode);
++  return Mode;
++}
++
++// ---- C runtime: XP's msvcrt.dll has no "secure" _s variants ----------------
++
++inline errno_t _wfopen_s(FILE **File, const wchar_t *Name,
++                         const wchar_t *Mode) {
++  typedef errno_t(__cdecl * Fn)(FILE **, const wchar_t *, const wchar_t *);
++  static Fn Real = lookup<Fn>("msvcrt.dll", "_wfopen_s");
++  if (Real)
++    return Real(File, Name, Mode);
++  *File = ::_wfopen(Name, Mode);
++  return *File ? 0 : errno;
++}
++
++inline errno_t _wsopen_s(int *Fd, const wchar_t *Name, int OFlag, int ShFlag,
++                         int PMode) {
++  typedef errno_t(__cdecl * Fn)(int *, const wchar_t *, int, int, int);
++  static Fn Real = lookup<Fn>("msvcrt.dll", "_wsopen_s");
++  if (Real)
++    return Real(Fd, Name, OFlag, ShFlag, PMode);
++  *Fd = ::_wsopen(Name, OFlag, ShFlag, PMode);
++  return *Fd == -1 ? errno : 0;
++}
++
++} // namespace xpcompat
++} // namespace llvm
++
++#define GetErrorMode llvm::xpcompat::GetErrorMode
++#define _wfopen_s llvm::xpcompat::_wfopen_s
++#define _wsopen_s llvm::xpcompat::_wsopen_s
++#ifdef LLVM_XPCOMPAT_FINDFIRSTFILEEX
++#undef FindFirstFileEx
++#define FindFirstFileEx llvm::xpcompat::FindFirstFileExW
++#define FindFirstFileExW llvm::xpcompat::FindFirstFileExW
++#endif
++#define CancelIoEx llvm::xpcompat::CancelIoEx
++#define QueryFullProcessImageNameW llvm::xpcompat::QueryFullProcessImageNameW
++#define CreateSymbolicLinkW llvm::xpcompat::CreateSymbolicLinkW
++#define Wow64GetThreadContext llvm::xpcompat::Wow64GetThreadContext
++#define Wow64SetThreadContext llvm::xpcompat::Wow64SetThreadContext
++#define InitializeProcThreadAttributeList                                     \
++  llvm::xpcompat::InitializeProcThreadAttributeList
++#define UpdateProcThreadAttribute llvm::xpcompat::UpdateProcThreadAttribute
++#define DeleteProcThreadAttributeList                                         \
++  llvm::xpcompat::DeleteProcThreadAttributeList
++// (not CreateProcess: lldb has methods of that name and undefines it)
++#define CreateProcessW llvm::xpcompat::CreateProcessW
++#define LoadLibraryExA llvm::xpcompat::LoadLibraryExA
++#undef RegGetValue
++#define RegGetValue llvm::xpcompat::RegGetValueW
++#define RegGetValueW llvm::xpcompat::RegGetValueW
++#define SetFileInformationByHandle llvm::xpcompat::SetFileInformationByHandle
++#define GetFinalPathNameByHandleW llvm::xpcompat::GetFinalPathNameByHandleW
++#define CompareStringOrdinal llvm::xpcompat::CompareStringOrdinal
++// lldb has methods named GetThreadId; it calls llvm::xpcompat::GetThreadId
++#ifndef LLVM_XPCOMPAT_NO_GETTHREADID_MACRO
++#define GetThreadId llvm::xpcompat::GetThreadId
++#endif
++#define GetLargePageMinimum llvm::xpcompat::GetLargePageMinimum
++#ifdef LLVM_XPCOMPAT_PROCESSOR_GROUPS
++#define GetLogicalProcessorInformationEx                                      \
++  llvm::xpcompat::GetLogicalProcessorInformationEx
++#define GetProcessGroupAffinity llvm::xpcompat::GetProcessGroupAffinity
++#define GetThreadGroupAffinity llvm::xpcompat::GetThreadGroupAffinity
++#define SetThreadGroupAffinity llvm::xpcompat::SetThreadGroupAffinity
++#endif
++
++#endif
++
++// Outside the include guard: wherever lldb includes this, its GetThreadId
++// methods must not be renamed, whichever header got here first.
++#ifdef LLVM_XPCOMPAT_NO_GETTHREADID_MACRO
++#undef GetThreadId
++#endif
+diff -Nru a/llvm/include/llvm/Support/Windows/XPCompatShell.h b/llvm/include/llvm/Support/Windows/XPCompatShell.h
+--- a/llvm/include/llvm/Support/Windows/XPCompatShell.h	1969-12-31 18:00:00.000000000 -0600
++++ b/llvm/include/llvm/Support/Windows/XPCompatShell.h	2026-11-17 13:31:37.974768200 -0600
+@@ -0,0 +1,72 @@
++//===- llvm/Support/Windows/XPCompatShell.h - Windows XP fallbacks -*- C++ -*-//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// The shell API part of XPCompat.h, for files that include <shlobj.h>
++// (which cannot go into WindowsSupport.h: its COM headers clash with LLVM
++// names).  Include after <shlobj.h>.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_SUPPORT_WINDOWS_XPCOMPATSHELL_H
++#define LLVM_SUPPORT_WINDOWS_XPCOMPATSHELL_H
++
++#include "llvm/Support/Windows/XPCompat.h"
++#include <shlobj.h>
++
++namespace llvm {
++namespace xpcompat {
++
++// XP: the CSIDL equivalents through SHGetFolderPathW.
++inline HRESULT WINAPI SHGetKnownFolderPath(REFKNOWNFOLDERID Id, DWORD Flags,
++                                           HANDLE Token, PWSTR *Path) {
++  typedef HRESULT(WINAPI * Fn)(REFKNOWNFOLDERID, DWORD, HANDLE, PWSTR *);
++  static Fn Real = lookup<Fn>("shell32.dll", "SHGetKnownFolderPath");
++  if (Real)
++    return Real(Id, Flags, Token, Path);
++  int Csidl;
++  if (IsEqualGUID(Id, FOLDERID_Profile))
++    Csidl = CSIDL_PROFILE;
++  else if (IsEqualGUID(Id, FOLDERID_LocalAppData))
++    Csidl = CSIDL_LOCAL_APPDATA;
++  else if (IsEqualGUID(Id, FOLDERID_RoamingAppData))
++    Csidl = CSIDL_APPDATA;
++  else
++    return E_INVALIDARG;
++  if (Flags & KF_FLAG_CREATE)
++    Csidl |= CSIDL_FLAG_CREATE;
++  wchar_t Buf[MAX_PATH];
++  HRESULT R = ::SHGetFolderPathW(nullptr, Csidl, Token, 0, Buf);
++  if (R != S_OK)
++    return R;
++  size_t Bytes = (wcslen(Buf) + 1) * sizeof(wchar_t);
++  *Path = static_cast<PWSTR>(::CoTaskMemAlloc(Bytes));
++  if (!*Path)
++    return E_OUTOFMEMORY;
++  memcpy(*Path, Buf, Bytes);
++  return S_OK;
++}
++
++// XP has no IFileOperation either, so moving files to the recycle bin fails
++// before this is reached; this keeps the import out of the executable.
++inline HRESULT WINAPI SHCreateItemFromIDList(PCIDLIST_ABSOLUTE Pidl,
++                                             REFIID Iid, void **Out) {
++  typedef HRESULT(WINAPI * Fn)(PCIDLIST_ABSOLUTE, REFIID, void **);
++  static Fn Real = lookup<Fn>("shell32.dll", "SHCreateItemFromIDList");
++  if (Real)
++    return Real(Pidl, Iid, Out);
++  *Out = nullptr;
++  return E_NOTIMPL;
++}
++
++} // namespace xpcompat
++} // namespace llvm
++
++#define SHGetKnownFolderPath llvm::xpcompat::SHGetKnownFolderPath
++#define SHCreateItemFromIDList llvm::xpcompat::SHCreateItemFromIDList
++
++#endif
+diff -Nru a/llvm/lib/Support/Windows/Path.inc b/llvm/lib/Support/Windows/Path.inc
+--- a/llvm/lib/Support/Windows/Path.inc	2026-11-17 13:31:38.189491700 -0600
++++ b/llvm/lib/Support/Windows/Path.inc	2026-11-17 13:31:38.082359200 -0600
+@@ -27,6 +27,7 @@
+ #include "llvm/Support/Windows/WindowsSupport.h"
+ #include <shellapi.h>
+ #include <shlobj.h>
++#include "llvm/Support/Windows/XPCompatShell.h"
+ 
+ #undef max
+ 

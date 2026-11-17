@@ -6,10 +6,11 @@ It drives the hardware from user mode through the gcn4xp display driver,
 so it needs a **debug build** of the driver (`build.ps1 -DebugBuild`,
 version 0.1.1 or later).
 
-Status: runs the gfx8 examples of
-[LLVM-AMDGPU-Assembler-Extra](https://github.com/ROCm/LLVM-AMDGPU-Assembler-Extra)
-(`asm-kernel`, `dpp_reduce`, `ds_bpermute`, `fp16_native`, `fp16_storage`,
-`s_memrealtime`, `s_memrealtime_inline`) on an RX 580.
+Status: runs the gfx8 [examples](examples/README.md) on an RX 580.
+
+Programs are written and built on XP with the gcn4xp SDK
+([../sdk](../sdk/README.md)): clang for the host and GPU code, this
+runtime, and the examples.
 
 ## How it works
 
@@ -27,41 +28,29 @@ compute queue. The MEC microcode runs from video memory.
 Only one process can use the GPU at a time; `hsa_init` waits up to 10 s
 for the lock.
 
-## Building (on the XP machine, Cygwin)
+## Building
+
+The SDK script builds the runtime as part of the SDK. On its own, with a
+32-bit MinGW-w64 GCC (`msvcrt`, e.g. MSYS2's `mingw32`) and GNU make:
 
 ```
-make                       # build/libhsa-runtime.a, build/gcngpu.exe, build/hsatest.exe
-make examples EXAMPLES=<path>/LLVM-AMDGPU-Assembler-Extra/examples
+make                        build/libhsa-runtime.a, build/gcngpu.exe, build/hsatest.exe
+make install PREFIX=<dir>   <dir>/lib, <dir>/include/hsa, <dir>/bin
 ```
 
-Programs link with `build/libhsa-runtime.a -lgdi32 -luser32 -ladvapi32`
-and include `include/hsa.h` (and `hsa_ext_amd.h`).
-
-The example host code assumes a 64-bit process when it passes buffer
-pointers to kernels. The `examples` target compiles a copy of
-`common/dispatch.cpp` with that one line changed; the checkout itself is
-not modified.
+Programs include `<hsa/hsa.h>` (and `<hsa/hsa_ext_amd.h>`) and link with
+`-lhsa-runtime -lgdi32 -luser32 -ladvapi32`. The library is plain C built
+by GCC; clang and lld link it like their own. With GCC 15 the Makefile adds
+`-fno-late-combine-instructions`, which works around a miscompile (see
+[../sdk/gcc-check.c](../sdk/gcc-check.c)).
 
 ### Firmware
 
 The runtime needs the Polaris10 RLC and MEC images from linux-firmware
-(`polaris10_rlc.bin`, `polaris10_mec_2.bin` or `polaris10_mec.bin`; the
-`amdgpu/` directory). It looks in `GCN4XP_FIRMWARE`, else in `firmware\`
-next to the program or next to its parent directory. The images are not
-part of this repository.
-
-## Kernels
-
-GPU code is built elsewhere with any LLVM that has the AMDGPU backend:
-
-```
-LLVM_BIN=<llvm>/bin sh examples/build-kernels.sh <out dir> [<examples dir>]
-```
-
-`examples/kernels/` holds the gfx8 assembler examples ported from the old
-`.hsa_code_object_version` / `.amd_kernel_code_t` directives (code object
-v2, which current LLVM no longer accepts) to `.amdhsa_kernel`. The kernel
-bodies are unchanged. Copy the `.co` files next to the example programs.
+(`polaris10_rlc.bin`, `polaris10_mec_2.bin` or `polaris10_mec.bin`). It
+looks in `GCN4XP_FIRMWARE`; then in `firmware\` next to the program or next
+to its parent directory; then in `%GCN4XP_SDK_HOME%\firmware`. The SDK
+includes them; this repository does not.
 
 ## Tools
 
@@ -70,6 +59,7 @@ gcngpu init [-f]     start the engine (-f: reset it first)
 gcngpu status        engine and queue registers
 gcngpu cstest        one-lane shader without address translation
 gcngpu vmtest        the same through the shared user address space
+gcngpu memtest       CPU reads of video memory at each access width
 hsatest <file.co> [kernel]   load and run a kernel via the HSA API
 ```
 

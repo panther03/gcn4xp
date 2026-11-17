@@ -10,8 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "hsa.h"
-#include "hsa_ext_amd.h"
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
 #include "gcn_gpu.h"
 
 static hsa_agent_t g_agent;

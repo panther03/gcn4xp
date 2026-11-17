@@ -14,22 +14,6 @@
 #include "gcn_gpu.h"
 #include "gcn_regs.h"
 
-static const char *fw_dir(void)
-{
-    static char dir[MAX_PATH];
-    const char *env = getenv("GCN4XP_FIRMWARE");
-    char *slash;
-
-    if (env != NULL && env[0] != 0)
-        return env;
-    GetModuleFileNameA(NULL, dir, sizeof(dir) - 16);
-    slash = strrchr(dir, '\\');
-    if (slash != NULL)
-        *slash = 0;
-    strcat(dir, "/firmware");
-    return dir;
-}
-
 /* v0 = 0x12345678; store it at the address in s[0:1] */
 static const u32 g_store_shader[] = {
     0x7e0002ff, 0x12345678, /* v_mov_b32 v0, 0x12345678 */
@@ -174,6 +158,82 @@ static int vmtest(void)
     return *data == 0x12345678 ? 0 : 1;
 }
 
+/*
+ * CPU reads of video memory through the mapping, at each access width.
+ * Each width reads its own freshly written area (a pattern that differs
+ * from run to run), so stale data cached anywhere on the way shows up:
+ * once right after the writes, once after dropping the HDP read cache.
+ */
+#include <emmintrin.h>
+
+static u32 pattern(u32 seed, u32 i)
+{
+    return (seed ^ (i * 0x9e3779b1u)) + i;
+}
+
+static u32 read_check(volatile u32 *p, u32 words, int width, u32 seed)
+{
+    static u32 buf[4096];
+    u32 i, j, bad = 0;
+
+    if (width == 0) {
+        memcpy(buf, (const void *)p, words * 4);
+        for (i = 0; i < words; i++)
+            bad += buf[i] != pattern(seed, i);
+        return bad;
+    }
+    for (i = 0; i < words; i += width / 4) {
+        u32 w[4];
+
+        if (width == 4)
+            w[0] = p[i];
+        else if (width == 8)
+            _mm_storeu_si128((__m128i *)w,
+                             _mm_loadl_epi64((const __m128i *)(p + i)));
+        else
+            _mm_storeu_si128((__m128i *)w,
+                             _mm_loadu_si128((const __m128i *)(p + i)));
+        for (j = 0; j < (u32)width / 4; j++)
+            bad += w[j] != pattern(seed, i + j);
+    }
+    return bad;
+}
+
+static int memtest(void)
+{
+    enum { WORDS = 4096 };
+    static const int widths[4] = { 4, 8, 16, 0 };
+    static const char *const names[4] = { "32-bit", "64-bit", "128-bit",
+                                          "memcpy" };
+    volatile u32 *base = (volatile u32 *)gcn_dev_ptr(gcn_region_off() +
+                                                     GCN_TEST_OFF + 0x8000);
+    u32 seed = GetTickCount() * 2654435761u, total = 0, i;
+    int inval, k;
+
+    if (base == NULL) {
+        printf("video memory is not mapped: %s\n", gcn_dev_error());
+        return 1;
+    }
+    for (inval = 0; inval < 2; inval++) {
+        printf("%s:", inval ? "after HDP read cache drop" : "right after writing");
+        for (k = 0; k < 4; k++) {
+            volatile u32 *p = base + k * WORDS;
+            u32 s = seed + (u32)(inval * 4 + k), bad;
+
+            for (i = 0; i < WORDS; i++)
+                p[i] = pattern(s, i);
+            gcn_dev_flush_writes();
+            if (inval)
+                gcn_dev_invalidate_reads();
+            bad = read_check(p, WORDS, widths[k], s);
+            total += bad;
+            printf("  %s %u", names[k], bad);
+        }
+        printf("  (wrong words of %u)\n", WORDS);
+    }
+    return total != 0;
+}
+
 static int bench(void)
 {
     DWORD t = GetTickCount();
@@ -214,15 +274,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "gcngpu: %s\n", gcn_dev_error());
     if (strcmp(cmd, "init") == 0) {
         int force = argc > 2 && strcmp(argv[2], "-f") == 0;
-        r = gcn_gpu_init(fw_dir(), force, stdout) != 0;
+        r = gcn_gpu_init(gcn_firmware_dir(), force, stdout) != 0;
         if (r)
             gcn_gpu_status(stdout);
     } else if (strcmp(cmd, "status") == 0) {
         gcn_gpu_status(stdout);
     } else if (strcmp(cmd, "cstest") == 0) {
-        r = gcn_gpu_init(fw_dir(), 0, stdout) != 0 || cstest();
+        r = gcn_gpu_init(gcn_firmware_dir(), 0, stdout) != 0 || cstest();
     } else if (strcmp(cmd, "vmtest") == 0) {
-        r = gcn_gpu_init(fw_dir(), 0, stdout) != 0 || vmtest();
+        r = gcn_gpu_init(gcn_firmware_dir(), 0, stdout) != 0 || vmtest();
+    } else if (strcmp(cmd, "memtest") == 0) {
+        r = memtest();
     } else if (strcmp(cmd, "bench") == 0) {
         r = bench();
     } else {

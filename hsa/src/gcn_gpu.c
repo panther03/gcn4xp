@@ -82,6 +82,51 @@ static u64 region_mc(u32 off)
 
 /* ---- firmware files ---------------------------------------------------- */
 
+static int is_dir(const char *p)
+{
+    DWORD a = GetFileAttributesA(p);
+
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+const char *gcn_firmware_dir(void)
+{
+    static char dir[MAX_PATH + 16];
+    char exe[MAX_PATH], *slash;
+    const char *env = getenv("GCN4XP_FIRMWARE");
+
+    if (env != NULL && env[0] != 0)
+        return env;
+    /* next to the program, then next to its parent directory */
+    GetModuleFileNameA(NULL, exe, sizeof(exe) - 16);
+    slash = strrchr(exe, '\\');
+    if (slash != NULL)
+        *slash = 0;
+    snprintf(dir, sizeof(dir), "%s\\firmware", exe);
+    if (is_dir(dir))
+        return dir;
+    slash = strrchr(exe, '\\');
+    if (slash != NULL) {
+        *slash = 0;
+        snprintf(dir, sizeof(dir), "%s\\firmware", exe);
+        if (is_dir(dir))
+            return dir;
+    }
+    /* the SDK's copy */
+    env = getenv("GCN4XP_SDK_HOME");
+    if (env != NULL && env[0] != 0) {
+        snprintf(dir, sizeof(dir), "%s\\firmware", env);
+        if (is_dir(dir))
+            return dir;
+    }
+    GetModuleFileNameA(NULL, exe, sizeof(exe) - 16);
+    slash = strrchr(exe, '\\');
+    if (slash != NULL)
+        *slash = 0;
+    snprintf(dir, sizeof(dir), "%s\\firmware", exe);
+    return dir;     /* not there; the error names it */
+}
+
 typedef struct {
     u32 size_bytes;
     u32 header_size_bytes;

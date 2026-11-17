@@ -1,7 +1,10 @@
-// Ported from LLVM-AMDGPU-Assembler-Extra examples/gfx8/dpp_reduce.s
-// (University of Illinois/NCSA Open Source License, Copyright (c) 2016
-// Advanced Micro Devices, Inc.) to code object v5+ directives; the
-// kernel body is unchanged.
+// dpp_reduce.s - Running sum of a 64-element float array within one wavefront, using
+// data-parallel primitives (DPP row shifts and broadcasts).
+//
+// From AMD's AMDGPU assembler examples, Copyright (c) 2016 Advanced Micro
+// Devices, Inc., University of Illinois/NCSA Open Source License (see
+// ../LICENSE.AMD).  Ported from code object v2 directives to .amdhsa_kernel;
+// the kernel body is unchanged.
 .amdgcn_target "amdgcn-amd-amdhsa--gfx803"
 .text
 .globl hello_world

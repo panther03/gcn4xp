@@ -1,7 +1,9 @@
-// Ported from LLVM-AMDGPU-Assembler-Extra examples/gfx8/fp16_storage.s
-// (University of Illinois/NCSA Open Source License, Copyright (c) 2016
-// Advanced Micro Devices, Inc.) to code object v5+ directives; the
-// kernel body is unchanged.
+// fp16_native.s - Adds two arrays of half-precision floats with native f16 arithmetic.
+//
+// From AMD's AMDGPU assembler examples, Copyright (c) 2016 Advanced Micro
+// Devices, Inc., University of Illinois/NCSA Open Source License (see
+// ../LICENSE.AMD).  Ported from code object v2 directives to .amdhsa_kernel;
+// the kernel body is unchanged.
 .amdgcn_target "amdgcn-amd-amdhsa--gfx803"
 .text
 .globl hello_world
@@ -39,15 +41,8 @@ hello_world:
   // wait for memory operations to complete
   s_waitcnt     0
   
-  // convert input data to f32
-  v_cvt_f32_f16 v3, v3
-  v_cvt_f32_f16 v2, v2
+  v_add_f16     v3, v3, v2 // v3 = in1[i] + in2[i]
   
-  v_add_f32     v3, v3, v2 // v3 = in1[i] + in2[i]
-  
-  //convert result back to f16
-  v_cvt_f16_f32 v3, v3
-
   flat_store_short v[0:1], v3 // out[i] = v3
   s_endpgm
 .Lhello_world_end:

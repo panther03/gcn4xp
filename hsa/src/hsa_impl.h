@@ -15,8 +15,8 @@
 #ifndef HSA_IMPL_H
 #define HSA_IMPL_H
 
-#include "hsa.h"
-#include "hsa_ext_amd.h"
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
 #include "gcn_gpu.h"
 
 #define HSA_ISA_NAME   "amdgcn-amd-amdhsa--gfx803"

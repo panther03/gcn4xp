@@ -47,6 +47,12 @@ u64 gcn_mc_addr(u64 vram_offset);
  * it is not NULL.  Returns 0 on success.  Needs the device lock.
  */
 int gcn_gpu_init(const char *fw_dir, int force, FILE *log);
+/*
+ * Where the microcode is: GCN4XP_FIRMWARE, else a "firmware" directory next
+ * to the program or next to its parent directory, else the one in
+ * GCN4XP_SDK_HOME.
+ */
+const char *gcn_firmware_dir(void);
 int gcn_gpu_is_up(void);
 void gcn_gpu_status(FILE *out);
 

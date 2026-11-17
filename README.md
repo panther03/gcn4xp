@@ -4,8 +4,9 @@ A display driver for AMD GCN graphics cards (Polaris: RX 460–590) on
 32-bit Windows XP.
 
 Status: **2D desktop only.** No Direct3D, OpenGL, DirectDraw or video
-acceleration. GPU compute is available separately through an HSA runtime,
-see [hsa/README.md](hsa/README.md).
+acceleration. GPU compute is available separately through an HSA runtime
+([hsa/](hsa/README.md)), with an SDK for writing GPU programs on XP itself
+([sdk/](sdk/README.md)).
 
 ## What it does
 
@@ -120,6 +121,8 @@ inf/        gcn4xp.inf
 tools/      gcninst, gcnctl
 scripts/    deploy helper
 hsa/        compute: engine bring-up, HSA runtime, code object loader
+hsa/examples/  example GPU programs
+sdk/        builds the SDK: clang/lld/lldb, make and the runtime for XP
 ```
 
 Register definitions follow the Linux amdgpu register headers.

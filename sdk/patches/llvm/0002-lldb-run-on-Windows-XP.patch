@@ -1,0 +1,199 @@
+Let lldb run on Windows XP (32-bit, MinGW with libstdc++).
+
+- lldb/Host/windows/windows.h includes XPCompat.h (patch 0001).
+- MainLoopWindows: the thread HANDLE of a libstdc++ std::thread comes from
+  pthread_gethandle; without CancelIoEx (XP) the pipe monitor polls instead
+  of blocking in a read that could not be cancelled.
+- HostThreadWindows calls the GetThreadId stand-in by name (lldb has
+  methods of that name, so there is no macro).
+- ProcessRunLock uses std::shared_mutex instead of an SRWLOCK.
+- SocketAddress's own inet_ntop gets its own name, so that the calls do not
+  bind to the ws2_32.dll import.
+- ProcessWindows names the main module through QueryFullProcessImageNameW
+  when GetModuleFileNameExW cannot yet (XP, at the create-process event);
+  without it the main thread was never registered and nothing stopped.
+
+diff -Nru a/lldb/include/lldb/Host/windows/windows.h b/lldb/include/lldb/Host/windows/windows.h
+--- a/lldb/include/lldb/Host/windows/windows.h	2026-11-17 13:31:38.742262100 -0600
++++ b/lldb/include/lldb/Host/windows/windows.h	2026-11-17 13:31:38.634919300 -0600
+@@ -29,4 +29,9 @@
+ #define FAR
+ #define NEAR
+ 
++// Run-time fallbacks for the Vista and later APIs used here (Windows XP).
++// HostThreadWindows has a GetThreadId method and calls the fallback by name.
++#define LLVM_XPCOMPAT_NO_GETTHREADID_MACRO
++#include "llvm/Support/Windows/XPCompat.h"
++
+ #endif // LLDB_lldb_windows_h_
+diff -Nru a/lldb/source/Host/common/SocketAddress.cpp b/lldb/source/Host/common/SocketAddress.cpp
+--- a/lldb/source/Host/common/SocketAddress.cpp	2026-11-17 13:31:39.601225300 -0600
++++ b/lldb/source/Host/common/SocketAddress.cpp	2026-11-17 13:31:39.493055500 -0600
+@@ -32,6 +32,11 @@
+ // WindowsXP needs an inet_ntop implementation
+ #ifdef _WIN32
+ 
++// Under its own name: the Windows headers declare inet_ntop as an import
++// from ws2_32.dll (Vista and later) once _WIN32_WINNT is high enough, and
++// the calls below would bind to that.
++#define inet_ntop lldb_inet_ntop
++
+ #ifndef INET6_ADDRSTRLEN // might not be defined in older Windows SDKs
+ #define INET6_ADDRSTRLEN 46
+ #endif
+diff -Nru a/lldb/source/Host/windows/HostThreadWindows.cpp b/lldb/source/Host/windows/HostThreadWindows.cpp
+--- a/lldb/source/Host/windows/HostThreadWindows.cpp	2026-11-17 13:31:39.170975500 -0600
++++ b/lldb/source/Host/windows/HostThreadWindows.cpp	2026-11-17 13:31:39.066625400 -0600
+@@ -57,7 +57,7 @@
+ }
+ 
+ lldb::tid_t HostThreadWindows::GetThreadId() const {
+-  return ::GetThreadId(m_thread);
++  return llvm::xpcompat::GetThreadId(m_thread);
+ }
+ 
+ void HostThreadWindows::Reset() {
+@@ -68,5 +68,5 @@
+ }
+ 
+ bool HostThreadWindows::EqualsThread(lldb::thread_t thread) const {
+-  return GetThreadId() == ::GetThreadId(thread);
++  return GetThreadId() == llvm::xpcompat::GetThreadId(thread);
+ }
+diff -Nru a/lldb/source/Host/windows/MainLoopWindows.cpp b/lldb/source/Host/windows/MainLoopWindows.cpp
+--- a/lldb/source/Host/windows/MainLoopWindows.cpp	2026-11-17 13:31:38.960809100 -0600
++++ b/lldb/source/Host/windows/MainLoopWindows.cpp	2026-11-17 13:31:38.850330300 -0600
+@@ -25,9 +25,23 @@
+ #include <winerror.h>
+ #include <winsock2.h>
+ 
++#if defined(__MINGW32__) && !defined(_LIBCPP_VERSION)
++#include <pthread.h>
++#endif
++
+ using namespace lldb;
+ using namespace lldb_private;
+ 
++// The Windows handle of a std::thread.  With libstdc++ on MinGW the native
++// handle is a winpthreads pthread_t, not a HANDLE.
++static HANDLE ThreadHandle(std::thread &t) {
++#if defined(__MINGW32__) && !defined(_LIBCPP_VERSION)
++  return pthread_gethandle(t.native_handle());
++#else
++  return t.native_handle();
++#endif
++}
++
+ static DWORD ToTimeout(std::optional<MainLoopWindows::TimePoint> point) {
+   using namespace std::chrono;
+ 
+@@ -58,7 +72,7 @@
+       // Keep trying to cancel ReadFile() until the thread exits.
+       do {
+         CancelIoEx(m_handle, /*lpOverlapped=*/NULL);
+-      } while (WaitForSingleObject(m_monitor_thread.native_handle(), 1) ==
++      } while (WaitForSingleObject(ThreadHandle(m_monitor_thread), 1) ==
+                WAIT_TIMEOUT);
+       m_monitor_thread.join();
+     }
+@@ -88,6 +102,27 @@
+     // Wait until the MainLoop tells us to start.
+     WaitForSingleObject(m_ready, INFINITE);
+ 
++    if (!llvm::xpcompat::HaveCancelIoEx()) {
++      // Windows XP cannot cancel the blocking read below from another
++      // thread, so the destructor could never stop this thread.  Poll the
++      // pipe instead, checking m_stopped between polls.
++      while (!m_stopped) {
++        DWORD bytes_available = 0;
++        if (PeekNamedPipe(m_handle, NULL, 0, NULL, &bytes_available, NULL) &&
++            bytes_available == 0) {
++          Sleep(10);
++          continue;
++        }
++        // data, or the pipe is broken: either way the reader should look
++        SetEvent(m_event);
++        ResetEvent(m_ready);
++        while (!m_stopped &&
++               WaitForSingleObject(m_ready, 100) == WAIT_TIMEOUT)
++          ;
++      }
++      return;
++    }
++
+     do {
+       char buf[1];
+       DWORD bytes_read = 0;
+diff -Nru a/lldb/source/Host/windows/ProcessRunLock.cpp b/lldb/source/Host/windows/ProcessRunLock.cpp
+--- a/lldb/source/Host/windows/ProcessRunLock.cpp	2026-11-17 13:31:39.384931500 -0600
++++ b/lldb/source/Host/windows/ProcessRunLock.cpp	2026-11-17 13:31:39.276241300 -0600
+@@ -9,38 +9,41 @@
+ #include "lldb/Host/ProcessRunLock.h"
+ #include "lldb/Host/windows/windows.h"
+ 
+-static PSRWLOCK GetLock(lldb::rwlock_t lock) {
+-  return static_cast<PSRWLOCK>(lock);
++// A std::shared_mutex rather than an SRWLOCK, which needs Windows Vista; with
++// libstdc++ on MinGW it is a winpthreads rwlock, which works on Windows XP.
++#include <shared_mutex>
++
++static std::shared_mutex *GetLock(lldb::rwlock_t lock) {
++  return static_cast<std::shared_mutex *>(lock);
+ }
+ 
+ static bool ReadLock(lldb::rwlock_t rwlock) {
+-  ::AcquireSRWLockShared(GetLock(rwlock));
++  GetLock(rwlock)->lock_shared();
+   return true;
+ }
+ 
+ static bool ReadUnlock(lldb::rwlock_t rwlock) {
+-  ::ReleaseSRWLockShared(GetLock(rwlock));
++  GetLock(rwlock)->unlock_shared();
+   return true;
+ }
+ 
+ static bool WriteLock(lldb::rwlock_t rwlock) {
+-  ::AcquireSRWLockExclusive(GetLock(rwlock));
++  GetLock(rwlock)->lock();
+   return true;
+ }
+ 
+ static bool WriteUnlock(lldb::rwlock_t rwlock) {
+-  ::ReleaseSRWLockExclusive(GetLock(rwlock));
++  GetLock(rwlock)->unlock();
+   return true;
+ }
+ 
+ using namespace lldb_private;
+ 
+ ProcessRunLock::ProcessRunLock() : m_running(false) {
+-  m_rwlock = new SRWLOCK;
+-  InitializeSRWLock(GetLock(m_rwlock));
++  m_rwlock = new std::shared_mutex;
+ }
+ 
+-ProcessRunLock::~ProcessRunLock() { delete static_cast<SRWLOCK *>(m_rwlock); }
++ProcessRunLock::~ProcessRunLock() { delete GetLock(m_rwlock); }
+ 
+ bool ProcessRunLock::ReadTryLock() {
+   ::ReadLock(m_rwlock);
+diff -Nru a/lldb/source/Plugins/Process/Windows/Common/ProcessWindows.cpp b/lldb/source/Plugins/Process/Windows/Common/ProcessWindows.cpp
+--- a/lldb/source/Plugins/Process/Windows/Common/ProcessWindows.cpp	2026-11-17 13:31:39.825884000 -0600
++++ b/lldb/source/Plugins/Process/Windows/Common/ProcessWindows.cpp	2026-11-17 13:31:39.709159500 -0600
+@@ -57,6 +57,15 @@
+     copied = ::GetModuleFileNameExW(process_handle, NULL, file_name.data(),
+                                     file_name_size);
+   } while (copied >= file_name_size);
++  if (copied == 0) {
++    // Windows XP cannot name the main module before the process's loader
++    // has run, which is the case at the create-process debug event; the
++    // image name comes from the kernel instead.
++    DWORD size = file_name_size;
++    if (::QueryFullProcessImageNameW(process_handle, 0, file_name.data(),
++                                     &size))
++      copied = size;
++  }
+   file_name.resize(copied);
+   std::string result;
+   llvm::convertWideToUTF8(file_name.data(), result);

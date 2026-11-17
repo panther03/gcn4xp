@@ -295,30 +295,6 @@ int hsa_rt_ready(void)
     return g_refcount > 0;
 }
 
-static const char *firmware_dir(void)
-{
-    static char dir[MAX_PATH];
-    const char *env = getenv("GCN4XP_FIRMWARE");
-    char *slash;
-
-    if (env != NULL && env[0] != 0)
-        return env;
-    /* next to the program, then next to the program's parent directory */
-    GetModuleFileNameA(NULL, dir, sizeof(dir) - 32);
-    slash = strrchr(dir, '\\');
-    if (slash != NULL)
-        *slash = 0;
-    strcat(dir, "\\firmware");
-    if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) {
-        *strrchr(dir, '\\') = 0;
-        slash = strrchr(dir, '\\');
-        if (slash != NULL) {
-            strcpy(slash, "\\firmware");
-        }
-    }
-    return dir;
-}
-
 hsa_status_t hsa_init(void)
 {
     const GCN_INFO *info;
@@ -349,7 +325,7 @@ hsa_status_t hsa_init(void)
                      "or later)\n", gcn_dev_error());
         goto fail;
     }
-    if (gcn_gpu_init(firmware_dir(), 0, g_hsa_trace ? stderr : NULL) != 0) {
+    if (gcn_gpu_init(gcn_firmware_dir(), 0, g_hsa_trace ? stderr : NULL) != 0) {
         hsa_complain("cannot start the GPU: %s\n", gcn_gpu_error());
         goto fail;
     }
