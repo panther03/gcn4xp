@@ -1,0 +1,27 @@
+# win32k.sys exports used by the display driver: <name> <stdcall argument bytes>
+EngAllocMem 12
+EngFreeMem 4
+EngDeviceIoControl 28
+EngCreateBitmap 24
+EngCreateDeviceSurface 16
+EngAssociateSurface 12
+EngDeleteSurface 4
+EngLockSurface 4
+EngUnlockSurface 4
+EngCreatePalette 24
+EngDeletePalette 4
+EngBitBlt 44
+EngCopyBits 24
+EngTextOut 40
+EngStrokePath 32
+EngFillPath 28
+EngStrokeAndFillPath 40
+EngLineTo 36
+EngStretchBlt 44
+EngStretchBltROP 52
+EngAlphaBlend 28
+EngTransparentBlt 32
+EngGradientFill 40
+EngPlgBlt 44
+PATHOBJ_vGetBounds 8
+XLATEOBJ_iXlate 8

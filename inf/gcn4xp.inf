@@ -1,0 +1,102 @@
+; gcn4xp.inf - display driver for AMD GCN (Polaris) graphics on Windows XP x86
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGUID   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider    = %Provider%
+DriverVer   = 11/16/2026,0.1.0.0
+
+[DestinationDirs]
+DefaultDestDir = 11
+gcn.Miniport   = 12   ; system32\drivers
+gcn.Display    = 11   ; system32
+
+[SourceDisksNames]
+1 = %DiskId%,,,""
+
+[SourceDisksFiles]
+gcnmp.sys = 1
+gcndd.dll = 1
+
+[Manufacturer]
+%Mfg% = gcn.Models
+
+[gcn.Models]
+; Polaris 10 / 20 / 30 (Ellesmere)
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C0
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C1
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C2
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C4
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C7
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C8
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67C9
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67CA
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67CC
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67CF
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67D0
+%Polaris10% = gcn, PCI\VEN_1002&DEV_67DF
+%Polaris10% = gcn, PCI\VEN_1002&DEV_6FDF
+; Polaris 11 / 21 (Baffin)
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67E0
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67E1
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67E3
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67E7
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67E8
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67E9
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67EB
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67EF
+%Polaris11% = gcn, PCI\VEN_1002&DEV_67FF
+; Polaris 12 (Lexa)
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6980
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6981
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6985
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6986
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6987
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6995
+%Polaris12% = gcn, PCI\VEN_1002&DEV_6997
+%Polaris12% = gcn, PCI\VEN_1002&DEV_699F
+
+[gcn]
+CopyFiles = gcn.Miniport, gcn.Display
+
+[gcn.Miniport]
+gcnmp.sys
+
+[gcn.Display]
+gcndd.dll
+
+[gcn.Services]
+AddService = gcnmp, 0x00000002, gcn.Service, gcn.EventLog
+
+[gcn.Service]
+ServiceType    = 1          ; SERVICE_KERNEL_DRIVER
+StartType      = 1          ; SERVICE_SYSTEM_START
+ErrorControl   = 0          ; SERVICE_ERROR_IGNORE
+LoadOrderGroup = Video
+ServiceBinary  = %12%\gcnmp.sys
+
+[gcn.EventLog]
+AddReg = gcn.EventLog.AddReg
+
+[gcn.EventLog.AddReg]
+HKR,, EventMessageFile, 0x00020000, "%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\gcnmp.sys"
+HKR,, TypesSupported,   0x00010001, 7
+
+[gcn.SoftwareSettings]
+AddReg = gcn.SoftwareSettings.AddReg
+
+[gcn.SoftwareSettings.AddReg]
+HKR,, InstalledDisplayDrivers, 0x00010000, gcndd
+HKR,, VgaCompatible,           0x00010001, 0
+; The card is a multi-function PCI device (HDMI audio is function 1).  The
+; XP video port refuses to start such a device without this value.
+HKR,, MultiFunctionSupported,  0x00010000, 1
+
+[Strings]
+Provider  = "gcn4xp"
+Mfg       = "Advanced Micro Devices"
+DiskId    = "gcn4xp driver files"
+Polaris10 = "AMD Radeon RX 470/480/570/580/590 (gcn4xp)"
+Polaris11 = "AMD Radeon RX 460/560 (gcn4xp)"
+Polaris12 = "AMD Radeon RX 540/550 (gcn4xp)"

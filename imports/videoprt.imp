@@ -1,0 +1,15 @@
+# videoprt.sys exports used by the miniport: <name> <stdcall argument bytes>
+VideoPortInitialize 16
+VideoPortGetAccessRanges 32
+VideoPortGetBusData 24
+VideoPortGetDeviceBase 20
+VideoPortFreeDeviceBase 8
+VideoPortMapMemory 24
+VideoPortUnmapMemory 12
+VideoPortQueryServices 12
+VideoPortAllocatePool 16
+VideoPortFreePool 8
+VideoPortSetRegistryParameters 16
+VideoPortStallExecution 4
+VideoPortQueryPerformanceCounter 8
+VideoPortGetRegistryParameters 20
