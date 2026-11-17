@@ -5,7 +5,7 @@
 #ifndef GCN_SHARED_H
 #define GCN_SHARED_H
 
-#define GCN_VERSION 0x00000100 /* 0.1.0 */
+#define GCN_VERSION 0x00000101 /* 0.1.1: VRAM mapping for compute */
 
 /* ---- private miniport IOCTLs (display driver -> miniport) -------------- */
 
@@ -20,6 +20,18 @@
 #define IOCTL_GCN_SET_POINTER_POS   GCN_IOCTL(5) /* in: GCN_POINTER_POS */
 #define IOCTL_GCN_REG_READ          GCN_IOCTL(6) /* in: GCN_REG_IO, out: ULONG[] */
 #define IOCTL_GCN_REG_WRITE         GCN_IOCTL(7) /* in: GCN_REG_IO (debug builds) */
+/* debug builds: map part of the compute half of the aperture into the
+ * calling process (in: GCN_VRAM_MAP, out: PVOID) and unmap it (in: PVOID) */
+#define IOCTL_GCN_MAP_VRAM          GCN_IOCTL(8)
+#define IOCTL_GCN_UNMAP_VRAM        GCN_IOCTL(9)
+
+typedef struct _GCN_VRAM_MAP {
+    ULONG Offset;         /* from the start of VRAM, page aligned */
+    ULONG Length;
+} GCN_VRAM_MAP;
+
+/* The display driver uses the lower half of the aperture; compute the upper. */
+#define GCN_COMPUTE_OFFSET(aperture_len) ((aperture_len) / 2)
 
 #define GCN_CURSOR_DIM 64
 
@@ -81,6 +93,8 @@ typedef struct _GCN_REG_IO {
 #define GCN_ESC_REG_WRITE 3  /* Arg0 = index, Arg1 = value (debug builds) */
 #define GCN_ESC_STATS    4   /* out: GCN_STATS */
 #define GCN_ESC_VERIFY   5   /* out: GCN_VERIFY - compare shadow and VRAM */
+#define GCN_ESC_MAP_VRAM 6   /* Arg0 = offset, Arg1 = length, out: PVOID (debug) */
+#define GCN_ESC_UNMAP_VRAM 7 /* Arg0 = address from MAP_VRAM (debug builds) */
 
 typedef struct _GCN_ESC_HEADER {
     ULONG Op;

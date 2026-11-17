@@ -323,6 +323,21 @@ ULONG APIENTRY DrvEscape(SURFOBJ *pso, ULONG iEsc, ULONG cjIn, PVOID pvIn,
         io.Value = hdr.Arg1;
         return bMiniport(ppdev, IOCTL_GCN_REG_WRITE, &io, sizeof(io), NULL, 0,
                          NULL);
+    case GCN_ESC_MAP_VRAM: {
+        GCN_VRAM_MAP m;
+        m.Offset = hdr.Arg0;
+        m.Length = hdr.Arg1;
+        if (cjOut < sizeof(PVOID) ||
+            !bMiniport(ppdev, IOCTL_GCN_MAP_VRAM, &m, sizeof(m), pvOut,
+                       sizeof(PVOID), &cj))
+            return 0;
+        return cj;
+    }
+    case GCN_ESC_UNMAP_VRAM: {
+        PVOID va = (PVOID)(ULONG_PTR)hdr.Arg0;
+        return bMiniport(ppdev, IOCTL_GCN_UNMAP_VRAM, &va, sizeof(va), NULL,
+                         0, NULL);
+    }
 #endif
     case GCN_ESC_STATS:
         if (cjOut < sizeof(GCN_STATS))

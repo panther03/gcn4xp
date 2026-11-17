@@ -1150,6 +1150,54 @@ static BOOLEAN NTAPI GcnStartIO(PVOID HwExt, PVIDEO_REQUEST_PACKET Rp)
         WREG(Ext, io->Index, io->Value);
         break;
     }
+    case IOCTL_GCN_MAP_VRAM: {
+        /*
+         * Runs in the context of the process that called ExtEscape, so a
+         * user-mode mapping lands in that process.  Only the compute half
+         * of the aperture, never the display's framebuffer.
+         */
+        GCN_VRAM_MAP m;
+        PHYSICAL_ADDRESS phys;
+        ULONG len, space;
+        PVOID va = (PVOID)(LONG_PTR)-1;     /* NtCurrentProcess() */
+        if (Rp->InputBufferLength < sizeof(m) ||
+            Rp->OutputBufferLength < sizeof(PVOID)) {
+            st = ERROR_INSUFFICIENT_BUFFER;
+            break;
+        }
+        m = *(const GCN_VRAM_MAP *)Rp->InputBuffer;
+        if ((m.Offset & 0xfff) || m.Length == 0 ||
+            m.Offset < GCN_COMPUTE_OFFSET(Ext->FbLen) ||
+            m.Offset >= Ext->FbLen || m.Length > Ext->FbLen - m.Offset) {
+            st = ERROR_INVALID_PARAMETER;
+            break;
+        }
+        phys = Ext->FbPhys;
+        phys.LowPart += m.Offset;
+        len = m.Length;
+        space = VIDEO_MEMORY_SPACE_USER_MODE | VIDEO_MEMORY_SPACE_P6CACHE;
+        st = VideoPortMapMemory(Ext, phys, &len, &space, &va);
+        if (st != NO_ERROR) {
+            va = (PVOID)(LONG_PTR)-1;
+            space = VIDEO_MEMORY_SPACE_USER_MODE;
+            st = VideoPortMapMemory(Ext, phys, &len, &space, &va);
+        }
+        KLog(Ext, "vram: map %x+%x for user: %u at %08x\n", m.Offset,
+             m.Length, (ULONG)st, (ULONG)va);
+        if (st == NO_ERROR) {
+            *(PVOID *)Rp->OutputBuffer = va;
+            info = sizeof(PVOID);
+        }
+        break;
+    }
+    case IOCTL_GCN_UNMAP_VRAM:
+        if (Rp->InputBufferLength < sizeof(PVOID)) {
+            st = ERROR_INSUFFICIENT_BUFFER;
+            break;
+        }
+        st = VideoPortUnmapMemory(Ext, *(PVOID *)Rp->InputBuffer,
+                                  (HANDLE)(LONG_PTR)-1);
+        break;
 #endif
     default:
         st = ERROR_INVALID_FUNCTION;
@@ -1198,26 +1246,40 @@ static VP_STATUS NTAPI GcnSetPowerState(PVOID HwExt, ULONG HwId,
                                         PVIDEO_POWER_MANAGEMENT Pm)
 {
     PGCN_EXT Ext = (PGCN_EXT)HwExt;
-    INT10_BIOS_ARGUMENTS a;
-    ULONG dpms;
+    ULONG i, blank;
 
     if (HwId == DISPLAY_ADAPTER_HW_ID)
         return NO_ERROR;
 
-    /* Monitor child: VBE/PM display power state. */
+    /*
+     * Monitor child.  The VBE/PM BIOS call (4F10) does not reliably bring
+     * these cards' outputs back, so the display is blanked in the display
+     * controller instead: timing keeps running, only the pixel data stops.
+     */
     switch (Pm->PowerState) {
-    case VideoPowerOn:      dpms = 0; break;
-    case VideoPowerStandBy: dpms = 1; break;
-    case VideoPowerSuspend: dpms = 2; break;
-    case VideoPowerOff:     dpms = 4; break;
-    default:                return NO_ERROR;
+    case VideoPowerOn:
+        blank = 0;
+        break;
+    case VideoPowerStandBy:
+    case VideoPowerSuspend:
+    case VideoPowerOff:
+        blank = 1;
+        break;
+    default:
+        return NO_ERROR;
     }
-    if (Ext->Int10Ok && Ext->CurrentMode >= 0) {
-        memset(&a, 0, sizeof(a));
-        a.Eax = 0x4F10;
-        a.Ebx = 0x01 | (dpms << 8);
-        Ext->Int10.Int10CallBios(Ext->Int10.Context, &a);
+    for (i = 0; i < GCN_MAX_CRTC; i++) {
+        ULONG o = g_CrtcOffsets[i], v;
+
+        if (!(Ext->CrtcMask & (1u << i)))
+            continue;
+        v = RREG(Ext, mmCRTC_BLANK_CONTROL + o);
+        v &= ~((1u << 8) | (1u << 16));     /* BLANK_DATA_EN, BLANK_DE_MODE */
+        if (blank)
+            v |= 1u << 8;
+        WREG(Ext, mmCRTC_BLANK_CONTROL + o, v);
     }
+    KLog(Ext, "power: monitor %s\n", blank ? "blanked" : "on");
     return NO_ERROR;
 }
 
